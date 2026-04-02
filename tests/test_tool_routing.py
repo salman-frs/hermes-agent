@@ -127,3 +127,14 @@ class TestAutomaticToolRouting:
             )
 
             assert set(agent.valid_tool_names) == before
+
+    def test_invalid_known_tool_name_can_auto_expand_surface(self):
+        with self._agent_ctx() as agent:
+            agent._maybe_route_toolsets_for_turn("please explain this code simply")
+            assert "send_message" not in agent.valid_tool_names
+
+            expanded = agent._maybe_expand_for_tool_call("send_message")
+
+            assert expanded == "send_message"
+            assert "messaging" in set(agent.enabled_toolsets)
+            assert "send_message" in agent.valid_tool_names

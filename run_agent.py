@@ -63,6 +63,7 @@ else:
 
 # Import our tool system
 from model_tools import (
+    get_all_tool_names,
     get_tool_definitions,
     get_toolset_for_tool,
     handle_function_call,
@@ -3272,32 +3273,73 @@ class AIAgent:
                 logger.warning("Removed duplicate tool call: %s", tc.function.name)
         return unique if len(unique) < len(tool_calls) else tool_calls
 
-    def _repair_tool_call(self, tool_name: str) -> str | None:
+    def _repair_tool_call(self, tool_name: str, candidates: Optional[set[str]] = None) -> str | None:
         """Attempt to repair a mismatched tool name before aborting.
 
         1. Try lowercase
         2. Try normalized (lowercase + hyphens/spaces -> underscores)
         3. Try fuzzy match (difflib, cutoff=0.7)
 
-        Returns the repaired name if found in valid_tool_names, else None.
+        Returns the repaired name if found in the candidate set, else None.
         """
         from difflib import get_close_matches
 
-        # 1. Lowercase
+        candidate_set = candidates if candidates is not None else self.valid_tool_names
+        if not candidate_set:
+            return None
+
         lowered = tool_name.lower()
-        if lowered in self.valid_tool_names:
+        if lowered in candidate_set:
             return lowered
 
-        # 2. Normalize
         normalized = lowered.replace("-", "_").replace(" ", "_")
-        if normalized in self.valid_tool_names:
+        if normalized in candidate_set:
             return normalized
 
-        # 3. Fuzzy match
-        matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
+        matches = get_close_matches(lowered, candidate_set, n=1, cutoff=0.7)
         if matches:
             return matches[0]
 
+        return None
+
+    def _repair_any_tool_call(self, tool_name: str) -> str | None:
+        """Repair against all registered tools, not just the currently loaded surface."""
+        try:
+            all_tool_names = set(get_all_tool_names())
+        except Exception:
+            all_tool_names = set()
+        if not all_tool_names:
+            return None
+        return self._repair_tool_call(tool_name, all_tool_names)
+
+    def _maybe_expand_for_tool_call(self, tool_name: str) -> str | None:
+        """Auto-expand the active tool surface when the model asks for a known but unloaded tool."""
+        repaired = self._repair_any_tool_call(tool_name)
+        if not repaired:
+            return None
+        if repaired in self.valid_tool_names:
+            return repaired
+
+        toolset = get_toolset_for_tool(repaired)
+        if not toolset:
+            return None
+
+        available_toolsets = self._routing_universe()
+        current_toolsets = self._loaded_toolsets()
+        if toolset not in available_toolsets or toolset in current_toolsets:
+            return None
+
+        expanded = sorted(current_toolsets | {toolset})
+        self._refresh_tool_surface(
+            enabled_toolsets=expanded,
+            disabled_toolsets=self.disabled_toolsets,
+            quiet_mode=True,
+        )
+        if repaired in self.valid_tool_names:
+            logger.info("Auto-expanded tool surface for requested tool %s via toolset %s", repaired, toolset)
+            if not self.quiet_mode:
+                self._safe_print(f"🧠 Auto-expanded toolset '{toolset}' for requested tool '{repaired}'")
+            return repaired
         return None
 
     def _invalidate_system_prompt(self):
@@ -8356,13 +8398,19 @@ class AIAgent:
                             logging.debug(f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}...")
                     
                     # Validate tool call names - detect model hallucinations
-                    # Repair mismatched tool names before validating
+                    # First repair within the active surface, then try expanding
+                    # if the model requested a known but currently deferred tool.
                     for tc in assistant_message.tool_calls:
                         if tc.function.name not in self.valid_tool_names:
                             repaired = self._repair_tool_call(tc.function.name)
                             if repaired:
                                 print(f"{self.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                                 tc.function.name = repaired
+                                continue
+                            expanded = self._maybe_expand_for_tool_call(tc.function.name)
+                            if expanded:
+                                print(f"{self.log_prefix}🧠 Auto-expanded for tool: '{tc.function.name}' -> '{expanded}'")
+                                tc.function.name = expanded
                     invalid_tool_calls = [
                         tc.function.name for tc in assistant_message.tool_calls
                         if tc.function.name not in self.valid_tool_names
