@@ -453,6 +453,14 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "system_prompt_mode": "lazy",  # lazy | compact | full
+    },
+
+    # Automatic tool routing — start with a leaner tool surface and include
+    # heavyweight capability families only when the task strongly suggests they
+    # are needed. This reduces fixed schema tax without manual profile switching.
+    "tool_routing": {
+        "enabled": True,
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
