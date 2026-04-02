@@ -110,6 +110,101 @@ HONCHO_TOOL_NAMES = {
     "honcho_conclude",
 }
 
+_TOOL_ROUTING_CORE_TOOLSETS = {
+    "terminal",
+    "file",
+    "todo",
+    "memory",
+    "session_search",
+    "clarify",
+    "skills",
+}
+
+_TOOL_ROUTING_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "browser": (
+        "browser", "website", "web page", "webpage", "navigate", "click",
+        "login", "log in", "form", "selector", "dom", "captcha",
+        "screenshot", "open url", "visit site", "buka situs", "buka website",
+        "klik", "isi form", "halaman web",
+    ),
+    "web": (
+        "research", "search the web", "web search", "internet", "latest",
+        "news", "docs", "documentation", "look up", "find online",
+        "google", "googling", "cari di web", "cari di internet",
+        "riset", "dokumentasi", "berita terbaru",
+    ),
+    "vision": (
+        "image", "images", "photo", "picture", "screenshot", "ocr",
+        "diagram", "chart", "scan", "analyze image", "describe image",
+        "gambar", "foto", "analisis gambar", "lihat gambar",
+    ),
+    "image_gen": (
+        "generate image", "create image", "make image", "logo", "poster",
+        "banner", "illustration", "render", "draw", "artwork",
+        "buat gambar", "generate gambar", "buat logo", "ilustrasi",
+    ),
+    "tts": (
+        "text to speech", "tts", "read aloud", "voice", "voiceover",
+        "narrate", "audio", "speak this", "bacakan", "suara",
+        "ubah ke audio", "text jadi suara",
+    ),
+    "code_execution": (
+        "python", "script", "analyze data", "batch", "loop", "iterate",
+        "csv", "json", "dataframe", "benchmark", "calculate", "compute",
+        "programmatically", "parse this data", "transform data", "regex",
+        "sql", "yaml", "spreadsheet", "otomatis", "secara program",
+        "hitung", "olah data",
+    ),
+    "delegation": (
+        "parallel", "subagent", "delegate", "multi-agent", "multi agent",
+        "workstreams", "in parallel", "split this task", "delegasikan",
+        "paralel", "multi agen",
+    ),
+    "cronjob": (
+        "cron", "schedule", "scheduled", "every day", "every hour", "daily",
+        "weekly", "monthly", "remind me", "periodic", "automation schedule",
+        "jadwalkan", "terjadwal", "setiap hari", "setiap jam",
+        "mingguan", "bulanan",
+    ),
+    "moa": (
+        "multiple models", "multi model", "compare models", "second opinion",
+        "consensus", "best of several", "cross-check with models", "moa",
+        "bandingkan model", "konsensus model",
+    ),
+    "homeassistant": (
+        "home assistant", "smart home", "entity", "entities", "device",
+        "service call", "turn on the light", "turn off the light",
+        "lampu", "ac", "thermostat", "sensor rumah",
+    ),
+    "messaging": (
+        "send message", "send a message", "notify", "notification", "text someone",
+        "whatsapp", "telegram", "discord", "slack", "signal", "sms", "email",
+        "kirim pesan", "notifikasi", "chat ke",
+    ),
+    "rl": (
+        "reinforcement learning", "rl training", "grpo", "ppo", "reward model",
+        "atropos", "training run", "policy optimization",
+    ),
+    "honcho": (
+        "honcho", "peer card", "workspace memory", "representation",
+        "user model", "semantic memory",
+    ),
+}
+
+_TOOL_ROUTING_FILE_HINTS = re.compile(
+    r"\b[\w./-]+\.(?:py|ipynb|csv|json|jsonl|ya?ml|toml|ini|sql|parquet|xlsx?|tsv)\b",
+    re.IGNORECASE,
+)
+_TOOL_ROUTING_URL_HINT = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_TOOL_ROUTING_IMAGE_HINT = re.compile(
+    r"https?://\S+\.(?:png|jpe?g|webp|gif|bmp|svg)|\b\w+\.(?:png|jpe?g|webp|gif|bmp|svg)\b",
+    re.IGNORECASE,
+)
+
+_DEFAULT_MAX_TOOL_RESULT_CHARS = 100_000
+_SOFT_TOOL_RESULT_CHAR_CAP = 24_000
+_MIN_COMPACTED_TOOL_RESULT_CHARS = 4_000
+
 
 class _SafeWriter:
     """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
@@ -944,6 +1039,11 @@ class AIAgent:
         self.valid_tool_names = set()
         if self.tools:
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
+            self._tool_routing_universe = {
+                toolset
+                for toolset in (get_toolset_for_tool(name) for name in self.valid_tool_names)
+                if toolset
+            }
             tool_names = sorted(self.valid_tool_names)
             if not self.quiet_mode:
                 print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
@@ -1155,6 +1255,14 @@ class AIAgent:
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+        try:
+            tool_routing_cfg = _agent_cfg.get("tool_routing", {}) or {}
+            self._tool_routing_enabled = bool(tool_routing_cfg.get("enabled", True))
+        except Exception:
+            self._tool_routing_enabled = True
+        self._tool_route_locked = False
+        self._tool_routing_reason = None
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -1339,6 +1447,304 @@ class AIAgent:
                 self.status_callback("lifecycle", message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
+
+    def _refresh_tool_surface(
+        self,
+        *,
+        enabled_toolsets: Optional[List[str]],
+        disabled_toolsets: Optional[List[str]],
+        quiet_mode: bool = True,
+    ) -> None:
+        """Rebuild the active tool surface from a toolset selection."""
+        self.tools = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=quiet_mode,
+        )
+        self.valid_tool_names = {
+            tool["function"]["name"] for tool in self.tools
+        } if self.tools else set()
+        current_toolsets = {
+            toolset
+            for toolset in (get_toolset_for_tool(name) for name in self.valid_tool_names)
+            if toolset
+        }
+        self._tool_routing_universe = set(getattr(self, "_tool_routing_universe", set()) or set()) | current_toolsets
+        self.enabled_toolsets = enabled_toolsets
+        self.disabled_toolsets = disabled_toolsets
+
+    def _loaded_toolsets(self) -> set[str]:
+        return {
+            toolset
+            for toolset in (get_toolset_for_tool(name) for name in self.valid_tool_names)
+            if toolset
+        }
+
+    def _routing_universe(self) -> set[str]:
+        universe = set(getattr(self, "_tool_routing_universe", set()) or set())
+        universe.update(self._loaded_toolsets())
+        return universe
+
+    def _core_routed_toolsets(self, available_toolsets: set[str]) -> set[str]:
+        core = {ts for ts in _TOOL_ROUTING_CORE_TOOLSETS if ts in available_toolsets}
+        if self._honcho and "honcho" in available_toolsets:
+            core.add("honcho")
+        return core
+
+    def _message_implies_toolset(self, toolset: str, text: str) -> bool:
+        if not text:
+            return False
+
+        if any(keyword in text for keyword in _TOOL_ROUTING_KEYWORDS.get(toolset, ())):
+            return True
+
+        if toolset == "browser":
+            return bool(_TOOL_ROUTING_URL_HINT.search(text)) and any(
+                token in text
+                for token in ("open", "visit", "browse", "navigate", "click", "login", "klik", "buka")
+            )
+        if toolset == "web":
+            return bool(_TOOL_ROUTING_URL_HINT.search(text)) and any(
+                token in text
+                for token in ("summarize", "extract", "read", "scrape", "crawl", "ringkas", "ambil isi")
+            )
+        if toolset == "vision":
+            return bool(_TOOL_ROUTING_IMAGE_HINT.search(text))
+        if toolset == "code_execution":
+            return bool(_TOOL_ROUTING_FILE_HINTS.search(text)) or any(
+                token in text for token in ("```", "traceback", "stack trace", "dataset", "data set")
+            )
+        if toolset == "cronjob":
+            return bool(re.search(r"every\s+\d+\s*(minute|minutes|hour|hours|day|days|week|weeks)", text))
+        return False
+
+    def _infer_toolsets_from_message(self, user_message: str, available_toolsets: set[str]) -> set[str]:
+        text = (user_message or "").strip().lower()
+        if not text:
+            return set()
+
+        inferred = {
+            toolset
+            for toolset in available_toolsets
+            if self._message_implies_toolset(toolset, text)
+        }
+
+        if "browser" in inferred and "web" in available_toolsets and any(
+            token in text for token in ("find", "search", "cari", "look up", "lookup")
+        ):
+            inferred.add("web")
+        if "browser" in inferred and "vision" in available_toolsets and any(
+            token in text for token in ("screenshot", "captcha", "image", "gambar")
+        ):
+            inferred.add("vision")
+        return inferred
+
+    def _select_routed_toolsets(self, user_message: str) -> Optional[List[str]]:
+        """Choose a leaner tool bundle while preserving likely-needed capabilities."""
+        available_toolsets = self._routing_universe()
+        if not available_toolsets:
+            return None
+
+        selected = self._core_routed_toolsets(available_toolsets)
+        selected.update(self._infer_toolsets_from_message(user_message, available_toolsets))
+        if selected == available_toolsets or not selected:
+            return None
+        return sorted(selected)
+
+    def _maybe_route_toolsets_for_turn(
+        self,
+        user_message: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Apply adaptive tool routing.
+
+        First turn: shrink to a lean, task-matched subset.
+        Later turns: only expand if a newly requested capability family is missing.
+        """
+        if not self._tool_routing_enabled:
+            return
+
+        current_toolsets = self._loaded_toolsets()
+        if not current_toolsets:
+            return
+
+        if not self._tool_route_locked and not conversation_history:
+            routed = self._select_routed_toolsets(user_message)
+            self._tool_route_locked = True
+            if not routed:
+                return
+            self._tool_routing_reason = user_message[:160]
+            self._refresh_tool_surface(
+                enabled_toolsets=routed,
+                disabled_toolsets=self.disabled_toolsets,
+                quiet_mode=True,
+            )
+            if not self.quiet_mode:
+                self._safe_print("🧭 Auto-routed toolsets for this session: " + ", ".join(routed))
+            return
+
+        self._tool_route_locked = True
+        available_toolsets = self._routing_universe()
+        inferred = self._infer_toolsets_from_message(user_message, available_toolsets)
+        missing = sorted(inferred - current_toolsets)
+        if not missing:
+            return
+
+        expanded = sorted(current_toolsets | set(missing))
+        self._tool_routing_reason = user_message[:160]
+        self._refresh_tool_surface(
+            enabled_toolsets=expanded,
+            disabled_toolsets=self.disabled_toolsets,
+            quiet_mode=True,
+        )
+        if not self.quiet_mode:
+            self._safe_print("🧭 Expanded toolsets for this task: " + ", ".join(missing))
+
+    @staticmethod
+    def _compact_json_for_budget(value, budget_chars: int):
+        """Compact JSON-like values while preserving structure and high-signal keys."""
+        budget_chars = max(_MIN_COMPACTED_TOOL_RESULT_CHARS, budget_chars)
+
+        def _walk(node, budget: int):
+            if budget <= 0:
+                return "[truncated]"
+            if node is None or isinstance(node, (bool, int, float)):
+                return node
+            if isinstance(node, str):
+                if len(node) <= budget:
+                    return node
+                keep = max(64, budget - 40)
+                head = max(32, keep // 2)
+                tail = max(16, keep - head)
+                omitted = max(0, len(node) - head - tail)
+                return f"{node[:head]} ...[{omitted:,} chars omitted]... {node[-tail:]}"
+            if isinstance(node, list):
+                if not node:
+                    return []
+                item_budget = max(200, budget // max(1, min(len(node), 4)))
+                kept = [_walk(item, item_budget) for item in node[:4]]
+                if len(node) > 4:
+                    kept.append(f"...[{len(node) - 4} more items omitted]...")
+                return kept
+            if isinstance(node, dict):
+                compact = {}
+                keys = list(node.keys())
+                preferred = [
+                    key for key in (
+                        "success", "error", "message", "summary", "title", "path",
+                        "file", "count", "total_count", "items", "results", "matches",
+                    ) if key in node
+                ]
+                ordered_keys = preferred + [key for key in keys if key not in preferred]
+                item_budget = max(160, budget // max(1, min(len(ordered_keys), 6)))
+                for key in ordered_keys[:6]:
+                    compact[key] = _walk(node[key], item_budget)
+                omitted = len(ordered_keys) - min(len(ordered_keys), 6)
+                if omitted > 0:
+                    compact["_truncated_keys"] = omitted
+                return compact
+            text = str(node)
+            if len(text) <= budget:
+                return text
+            return text[: max(64, budget - 32)] + " ...[truncated]"
+
+        return _walk(value, budget_chars)
+
+    @staticmethod
+    def _compact_plaintext_for_budget(text: str, budget_chars: int) -> str:
+        """Compact plain text by keeping the most informative head/tail and sample lines."""
+        if len(text) <= budget_chars:
+            return text
+        budget_chars = max(_MIN_COMPACTED_TOOL_RESULT_CHARS, budget_chars)
+        lines = text.splitlines()
+        if len(lines) <= 12:
+            head = max(400, budget_chars // 2)
+            tail = max(200, budget_chars - head - 120)
+            omitted = max(0, len(text) - head - tail)
+            return (
+                text[:head]
+                + f"\n\n...[{omitted:,} chars omitted to preserve context budget]...\n\n"
+                + text[-tail:]
+            )
+
+        head_lines = lines[:6]
+        tail_lines = lines[-6:]
+        middle_count = max(0, len(lines) - 12)
+        compacted = "\n".join(head_lines)
+        compacted += f"\n\n...[{middle_count:,} middle lines omitted to preserve context budget]...\n\n"
+        compacted += "\n".join(tail_lines)
+        if len(compacted) <= budget_chars:
+            return compacted
+        head = max(400, budget_chars // 2)
+        tail = max(200, budget_chars - head - 120)
+        omitted = max(0, len(compacted) - head - tail)
+        return compacted[:head] + f"\n\n...[{omitted:,} chars omitted]...\n\n" + compacted[-tail:]
+
+    def _compact_tool_result_for_context(
+        self,
+        function_name: str,
+        function_result: str,
+        messages: List[Dict[str, Any]],
+        active_system_prompt: str,
+        tool_call_id: str,
+    ) -> str:
+        """Shrink oversized tool results when they threaten context budget."""
+        if not function_result:
+            return function_result
+
+        hard_capped = function_result
+        if len(hard_capped) > _DEFAULT_MAX_TOOL_RESULT_CHARS:
+            original_len = len(hard_capped)
+            hard_capped = (
+                hard_capped[:_DEFAULT_MAX_TOOL_RESULT_CHARS]
+                + f"\n\n[Truncated: tool response was {original_len:,} chars, "
+                f"exceeding the {_DEFAULT_MAX_TOOL_RESULT_CHARS:,} char limit]"
+            )
+
+        threshold = getattr(self.context_compressor, "threshold_tokens", 0) or 0
+        projected_tokens = estimate_request_tokens_rough(
+            messages + [{"role": "tool", "content": hard_capped, "tool_call_id": tool_call_id}],
+            system_prompt=active_system_prompt or "",
+            tools=self.tools or None,
+        )
+        near_threshold = bool(threshold and projected_tokens >= int(threshold * 0.85))
+        if len(hard_capped) <= _SOFT_TOOL_RESULT_CHAR_CAP and not near_threshold:
+            return hard_capped
+
+        budget_chars = _SOFT_TOOL_RESULT_CHAR_CAP
+        if threshold:
+            current_tokens = estimate_request_tokens_rough(
+                messages,
+                system_prompt=active_system_prompt or "",
+                tools=self.tools or None,
+            )
+            remaining_tokens = max(0, threshold - current_tokens)
+            budget_chars = min(
+                _SOFT_TOOL_RESULT_CHAR_CAP,
+                max(_MIN_COMPACTED_TOOL_RESULT_CHARS, remaining_tokens * 2),
+            )
+
+        try:
+            parsed = json.loads(hard_capped)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+
+        if parsed is not None:
+            compacted = json.dumps(self._compact_json_for_budget(parsed, budget_chars), ensure_ascii=False)
+        else:
+            compacted = self._compact_plaintext_for_budget(hard_capped, budget_chars)
+
+        if len(compacted) >= len(hard_capped):
+            return hard_capped
+
+        omitted = len(hard_capped) - len(compacted)
+        notice = (
+            f"\n\n[Context-optimized {function_name} result: saved approximately {omitted:,} chars "
+            f"to preserve reasoning budget]"
+        )
+        if len(compacted) + len(notice) <= max(_MIN_COMPACTED_TOOL_RESULT_CHARS, budget_chars + 160):
+            compacted += notice
+        return compacted
 
     def _is_direct_openai_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets OpenAI's native API."""
@@ -6475,6 +6881,12 @@ class AIAgent:
         # Preserve the original user message (no nudge injection).
         # Honcho should receive the actual user input, not system nudges.
         original_user_message = persist_user_message if persist_user_message is not None else user_message
+
+        # Automatic capability routing: on a fresh session, shrink the tool surface
+        # before building the cached system prompt so prompt/schema overhead stays
+        # low for the conversation. Later turns may expand when a missing
+        # capability family becomes clearly necessary.
+        self._maybe_route_toolsets_for_turn(original_user_message, conversation_history)
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on

@@ -28,6 +28,8 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+_SKILLS_PROMPT_MODES = {"lazy", "compact", "full"}
+
 # ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection in AGENTS.md, .cursorrules,
 # SOUL.md before they get injected into the system prompt.
@@ -295,6 +297,74 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
+def _get_skills_prompt_mode() -> str:
+    """Return the configured skills system-prompt mode.
+
+    Modes:
+      - lazy (default): no catalog in the system prompt; instruct the model to
+        use skills_list/skill_view on demand.
+      - compact: small category summary plus a few example skill names.
+      - full: legacy full catalog injection.
+    """
+    try:
+        import yaml
+
+        config_path = get_hermes_home() / "config.yaml"
+        if config_path.exists():
+            with open(config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            skills_cfg = cfg.get("skills") or {}
+            raw_mode = skills_cfg.get("system_prompt_mode", "lazy")
+            mode = str(raw_mode).strip().lower()
+            if mode in _SKILLS_PROMPT_MODES:
+                return mode
+    except Exception as e:
+        logger.debug("Could not read skills.system_prompt_mode from config.yaml: %s", e)
+    return "lazy"
+
+
+def _render_lazy_skills_prompt() -> str:
+    return (
+        "## Skills (on-demand)\n"
+        "Installed skills are available, but the full catalog is intentionally omitted to keep the context window lean. "
+        "When a task may benefit from a skill, discover it on demand with skills_list, then load the specific skill with skill_view(name). "
+        "Do not speculate about skill contents without loading them. "
+        "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        "After difficult or reusable work, offer to save the workflow as a skill."
+    )
+
+
+def _render_compact_skills_prompt(
+    skills_by_category: dict[str, list[tuple[str, str]]],
+    category_descriptions: dict[str, str],
+) -> str:
+    lines = []
+    for category in sorted(skills_by_category.keys()):
+        skills = sorted(skills_by_category[category], key=lambda x: x[0])
+        count = len(skills)
+        examples = ", ".join(name for name, _desc in skills[:3])
+        extra = f" (+{count - 3} more)" if count > 3 else ""
+        cat_desc = category_descriptions.get(category, "")
+        header = f"  {category}: {count} skill{'s' if count != 1 else ''}"
+        if cat_desc:
+            header += f" — {cat_desc}"
+        lines.append(header)
+        if examples:
+            lines.append(f"    examples: {examples}{extra}")
+
+    return (
+        "## Skills (discoverable)\n"
+        "Use skills_list to browse the relevant category when a task may benefit from a skill, then load only the needed skill with skill_view(name). "
+        "Do not pre-emptively load unrelated skills. If a loaded skill has issues, fix it with skill_manage(action='patch').\n"
+        "\n"
+        "<available_skill_categories>\n"
+        + "\n".join(lines) + "\n"
+        "</available_skill_categories>\n"
+        "\n"
+        "After difficult or reusable work, offer to save the workflow as a skill."
+    )
+
+
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files."""
     manifest: dict[str, list[int]] = {}
@@ -461,6 +531,7 @@ def build_skills_system_prompt(
     hermes_home = get_hermes_home()
     skills_dir = hermes_home / "skills"
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    prompt_mode = _get_skills_prompt_mode()
 
     if not skills_dir.exists() and not external_dirs:
         return ""
@@ -471,6 +542,7 @@ def build_skills_system_prompt(
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
+        prompt_mode,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -605,42 +677,47 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
-    if not skills_by_category:
+    if prompt_mode == "lazy":
+        result = _render_lazy_skills_prompt()
+    elif not skills_by_category:
         result = ""
     else:
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+        if prompt_mode == "compact":
+            result = _render_compact_skills_prompt(skills_by_category, category_descriptions)
+        else:
+            index_lines = []
+            for category in sorted(skills_by_category.keys()):
+                cat_desc = category_descriptions.get(category, "")
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"  {category}:")
+                # Deduplicate and sort skills within each category
+                seen = set()
+                for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if desc:
+                        index_lines.append(f"    - {name}: {desc}")
+                    else:
+                        index_lines.append(f"    - {name}")
 
-        result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If one clearly matches your task, "
-            "load it with skill_view(name) and follow its instructions. "
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "If none match, proceed normally without loading a skill."
-        )
+            result = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If one clearly matches your task, "
+                "load it with skill_view(name) and follow its instructions. "
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "If none match, proceed normally without loading a skill."
+            )
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:

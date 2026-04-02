@@ -240,10 +240,12 @@ class TestPromptBuilderImports:
 
 class TestBuildSkillsSystemPrompt:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
+    def _clear_skills_cache(self, monkeypatch):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
+        import agent.prompt_builder as prompt_builder
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
+        monkeypatch.setattr(prompt_builder, "_get_skills_prompt_mode", lambda: "full")
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
 
@@ -252,8 +254,24 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         assert result == ""
 
-    def test_builds_index_with_skills(self, monkeypatch, tmp_path):
+    def test_builds_on_demand_prompt_with_skills(self, monkeypatch, tmp_path):
+        import agent.prompt_builder as prompt_builder
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(prompt_builder, "_get_skills_prompt_mode", lambda: "lazy")
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        result = build_skills_system_prompt()
+        assert "Skills (on-demand)" in result
+        assert "skills_list" in result
+        assert "skill_view" in result
+
+    def test_full_mode_builds_index_with_skills(self, monkeypatch, tmp_path):
+        import agent.prompt_builder as prompt_builder
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(prompt_builder, "_get_skills_prompt_mode", lambda: "full")
         skills_dir = tmp_path / "skills" / "coding" / "python-debug"
         skills_dir.mkdir(parents=True)
         (skills_dir / "SKILL.md").write_text(
@@ -263,6 +281,20 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_compact_mode_builds_category_summary(self, monkeypatch, tmp_path):
+        import agent.prompt_builder as prompt_builder
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(prompt_builder, "_get_skills_prompt_mode", lambda: "compact")
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        result = build_skills_system_prompt()
+        assert "available_skill_categories" in result
+        assert "coding: 1 skill" in result
+        assert "python-debug" in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -883,9 +915,11 @@ class TestSkillShouldShow:
 
 class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
-    def _clear_skills_cache(self):
+    def _clear_skills_cache(self, monkeypatch):
+        import agent.prompt_builder as prompt_builder
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
+        monkeypatch.setattr(prompt_builder, "_get_skills_prompt_mode", lambda: "full")
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
 
